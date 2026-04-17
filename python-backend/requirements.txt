@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+MetaTrader5
+yfinance
+pandas
+numpy
+plotly
+scipy
+transformers
+torch
+python-dotenv
+httpx
+nltk

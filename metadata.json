@@ -1,0 +1,6 @@
+{
+  "name": "AlphaGold AI - Prop Evaluation Bot",
+  "description": "An AI-powered XAU/USD trading system optimized for passing Funding Pips evaluations with grid strategies, news sentiment analysis, and robust risk management.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
