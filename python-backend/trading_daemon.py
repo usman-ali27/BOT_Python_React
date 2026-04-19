@@ -5,6 +5,10 @@ import threading
 import MetaTrader5 as mt5
 import pandas as pd
 from mt5_engine import mt5_engine
+from prop_firm_rules import compute_prop_risk_snapshot, get_profile, trading_day_key
+
+# Sentiment analysis
+from sentiment import gold_sentiment
 
 # Ensure project root is in sys.path for grid_engine import
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -26,20 +30,77 @@ from grid_engine import (
 )
 
 class TradingDaemon:
-    def __init__(self, symbol="XAUUSD", initial_balance=100000):
+    def log_open_levels_stats(self):
+        """Log stats for all currently open grid levels for live AI feedback and analytics."""
+        from grid_engine import get_open_levels, save_grid_state
+        import datetime
+        open_levels = get_open_levels(self.grid_state)
+        now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        for lv in open_levels:
+            # Log unrealized PnL and duration
+            unrealized_pnl = 0.0
+            if lv.entry_price > 0:
+                tick = mt5.symbol_info_tick(self.symbol)
+                if tick:
+                    if lv.direction == "BUY":
+                        unrealized_pnl = (tick.ask - lv.entry_price) * lv.lot * 100.0
+                    else:
+                        unrealized_pnl = (lv.entry_price - tick.bid) * lv.lot * 100.0
+            duration = 0.0
+            if lv.opened_at:
+                try:
+                    opened_dt = datetime.datetime.fromisoformat(lv.opened_at.replace('Z', '+00:00'))
+                    duration = (datetime.datetime.now(datetime.timezone.utc) - opened_dt).total_seconds() / 60
+                except Exception:
+                    pass
+            # Append to audit log as LIVE_LEVEL
+            from grid_engine import append_grid_audit
+            append_grid_audit({
+                "event": "LIVE_LEVEL",
+                "level_id": lv.level_id,
+                "symbol": self.symbol,
+                "direction": lv.direction,
+                "entry_price": lv.entry_price,
+                "lot": lv.lot,
+                "unrealized_pnl": unrealized_pnl,
+                "duration_min": duration,
+                "opened_at": lv.opened_at,
+                "timestamp": now,
+            })
+
+    def _should_pause_grid(self, df):
+        """Return True if volatility or trend is too high for safe grid trading."""
+        if len(df) < 20:
+            return False
+        recent = df.tail(20)
+        volatility = recent['Close'].std()
+        trend_strength = abs(recent['Close'].iloc[-1] - recent['Close'].mean())
+        if volatility > 10 or trend_strength > 10:
+            print(f"[GRID FILTER] High volatility ({volatility:.2f}) or trend ({trend_strength:.2f}) detected. Pausing grid.")
+            return True
+        return False
+    def __init__(self, symbol="XAUUSD", initial_balance=10000.0):
         self.is_running = False
         self.symbol = symbol
         self.initial_balance = initial_balance
         self.daily_start_equity = initial_balance
-        
-        # Prop Firm Rules
-        self.max_daily_loss = 0.045
-        self.max_total_loss = 0.10
-        self.leverage = 500
+        self.daily_start_balance = initial_balance
+        self.prop_profile = get_profile("shared_10k_2step")
+        self.prop_day_key = trading_day_key(self.prop_profile)
+        self.prop_risk_status = None
+        self.last_backtest_result = None
         
         # Grid settings
         self.lot_size = 0.01
         self.grid_state = load_grid_state()
+
+    def set_prop_profile(self, profile_key: str):
+        self.prop_profile = get_profile(profile_key)
+        self.prop_day_key = trading_day_key(self.prop_profile)
+        self.initial_balance = self.prop_profile.account_size
+        self.daily_start_balance = self.initial_balance
+        self.daily_start_equity = self.initial_balance
+        return self.prop_profile
         
     def start(self):
         if not mt5_engine.connected:
@@ -48,22 +109,36 @@ class TradingDaemon:
             
         print("Running XAUUSD backtest intelligence matrix...")
         from backtest_engine import backtest_engine
-        results = backtest_engine.run_backtest()
-        
+        results = backtest_engine.run_backtest(profile_key=self.prop_profile.key)
+        self.last_backtest_result = results
+
         if "error" in results:
-            print(f"[WARNING] Backtest offline/error: {results['error']} -> Bypassing for dev environment.")
-            accuracy = 0.88  # Bypass threshold
-        else:
-            accuracy = results.get("accuracy", 0)
-        
-        if accuracy < 0.70:
-             print(f"[REJECTED] Backtest accuracy too low ({accuracy * 100:.1f}%). Refusing entry.")
-             return False
+            print(f"[REJECTED] Backtest error: {results['error']}. Refusing entry.")
+            return False
+
+        if not results.get("passed_backtest_gate", False):
+            print("[REJECTED] Backtest gate failed. Refusing entry.")
+            return False
+
+        account_status = mt5_engine.get_account_status()
+        if account_status:
+            balance = float(account_status.get("balance", self.initial_balance))
+            equity = float(account_status.get("equity", balance))
+            self.initial_balance = self.prop_profile.account_size
+            self.daily_start_balance = balance
+            self.daily_start_equity = equity
+            self.prop_day_key = trading_day_key(self.prop_profile)
         
         self.is_running = True
         self.thread = threading.Thread(target=self._run_loop)
         self.thread.start()
-        print(f"Trading Daemon started successfully with historical precision {accuracy * 100:.1f}%.")
+        # Start scheduled grid re-analysis every 5 minutes automatically
+        self.schedule_grid_reanalysis(interval_minutes=5)
+        print(
+            "Trading Daemon started successfully. "
+            f"Win rate {results.get('win_rate_pct', 0):.1f}% | "
+            f"PF {results.get('profit_factor', 0):.2f}"
+        )
         return True
 
     def stop(self):
@@ -73,33 +148,33 @@ class TradingDaemon:
         print("Trading Daemon stopped.")
 
     def update_daily_equity(self):
-        # We should reset daily start equity at UTC 00:00 (broker time)
-        # For simulation, just setting it now.
         status = mt5_engine.get_account_status()
         if status:
-            self.daily_start_equity = status['equity']
+            current_day_key = trading_day_key(self.prop_profile)
+            if current_day_key != self.prop_day_key:
+                self.prop_day_key = current_day_key
+                self.daily_start_balance = float(status['balance'])
+                self.daily_start_equity = float(status['equity'])
 
-    def check_prop_firm_rules(self, current_equity):
-        if self.initial_balance <= 0 or self.daily_start_equity <= 0:
-            self.initial_balance = current_equity
-            self.daily_start_equity = current_equity
-            return True
-            
-        total_drawdown = (self.initial_balance - current_equity) / self.initial_balance
-        daily_drawdown = (self.daily_start_equity - current_equity) / self.daily_start_equity
-        
-        if daily_drawdown >= self.max_daily_loss:
-            print(f"[EMERGENCY] 5% Daily Loss Hit. (Start: {self.daily_start_equity}, Now: {current_equity})")
+    def check_prop_firm_rules(self, balance, equity):
+        snapshot = compute_prop_risk_snapshot(
+            self.prop_profile,
+            balance=float(balance),
+            equity=float(equity),
+            day_start_balance=float(self.daily_start_balance),
+            day_start_equity=float(self.daily_start_equity),
+        )
+        self.prop_risk_status = snapshot
+
+        if snapshot.breached:
+            print(f"[EMERGENCY] {snapshot.breach_reason}")
             self.stop()
             self._close_all_positions()
             return False
-            
-        if total_drawdown >= self.max_total_loss:
-            print(f"[EMERGENCY] 10% Total Loss Hit. (Start: {self.initial_balance}, Now: {current_equity})")
-            self.stop()
-            self._close_all_positions()
-            return False
-            
+
+        if snapshot.soft_breached:
+            print(f"[RISK WARNING] {snapshot.soft_reason}")
+
         return True
 
     def _close_all_positions(self):
@@ -147,17 +222,15 @@ class TradingDaemon:
                     time.sleep(1)
                     continue
                     
-                equity = account_status['equity']
-                
-                # Fix: dynamically adopt the live account initial balance if it's massively mismatched
-                if self.initial_balance > equity * 1.5 or self.initial_balance < equity * 0.5:
-                    self.initial_balance = round(equity, 2)
-                    self.daily_start_equity = round(equity, 2)
-                    
-                if not self.check_prop_firm_rules(equity):
+                balance = float(account_status['balance'])
+                equity = float(account_status['equity'])
+
+                if not self.check_prop_firm_rules(balance, equity):
                     break
                     
                 self._process_advanced_grid()
+                # Log open level stats for live AI feedback
+                self.log_open_levels_stats()
                 time.sleep(1)
             except Exception as e:
                 print(f"[THREAD CRASH] Grid loop error: {e}")
@@ -169,6 +242,20 @@ class TradingDaemon:
         if not tick:
             return
 
+        # Sentiment analysis filter
+        try:
+            sentiment = gold_sentiment()
+            print(f"[SENTIMENT] Gold news sentiment score: {sentiment:.2f}")
+            # If sentiment is strongly negative or positive, pause grid for safety
+            if sentiment < -0.3:
+                print("[SENTIMENT] Strong negative sentiment detected. Pausing grid activation.")
+                return
+            if sentiment > 0.3:
+                print("[SENTIMENT] Strong positive sentiment detected. Pausing grid activation.")
+                return
+        except Exception as e:
+            print(f"[SENTIMENT] Sentiment analysis failed: {e}")
+
         # Load live OHLCV for Grid AI structure analysis
         rates = mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_M15, 0, 100)
         if rates is None or len(rates) == 0:
@@ -178,6 +265,37 @@ class TradingDaemon:
         df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
 
         current_price = tick.ask  # Proxy execution standard
+
+        # --- Grid Expiry/Deactivation Logic ---
+        import datetime
+        if self.grid_state.active:
+            # If all levels are pending and grid is older than 15 minutes, deactivate
+            pending_levels = [lv for lv in self.grid_state.levels if lv.status == "PENDING"]
+            open_levels = [lv for lv in self.grid_state.levels if lv.status == "OPEN"]
+            if len(pending_levels) == len(self.grid_state.levels) and len(pending_levels) > 0:
+                try:
+                    created_dt = datetime.datetime.fromisoformat(self.grid_state.created_at.replace('Z', '+00:00'))
+                    age_minutes = (datetime.datetime.now(datetime.timezone.utc) - created_dt).total_seconds() / 60
+                    if age_minutes > 15:
+                        print(f"[GRID ENGINE] Grid expired (all pending, age {age_minutes:.1f} min). Deactivating.")
+                        self.grid_state = deactivate_grid(self.grid_state)
+                        save_grid_state(self.grid_state)
+                        train()
+                        return
+                except Exception:
+                    pass
+            # If grid is older than 1 hour, deactivate regardless
+            try:
+                created_dt = datetime.datetime.fromisoformat(self.grid_state.created_at.replace('Z', '+00:00'))
+                age_minutes = (datetime.datetime.now(datetime.timezone.utc) - created_dt).total_seconds() / 60
+                if age_minutes > 60:
+                    print(f"[GRID ENGINE] Grid forcibly expired (age {age_minutes:.1f} min). Deactivating.")
+                    self.grid_state = deactivate_grid(self.grid_state)
+                    save_grid_state(self.grid_state)
+                    train()
+                    return
+            except Exception:
+                pass
 
         # 1. Basket Profit Trailing & SL Guards
         if self.grid_state.active:
@@ -257,13 +375,16 @@ class TradingDaemon:
         # 3. Dynamic Bias Grid Generation (AI Brain integration)
         if not self.grid_state.active:
             print("[GRID ENGINE] Analyzing Regimes & Computing New Layout...")
-            # --- AI Brain Recommendation ---
+            if self._should_pause_grid(df):
+                print("[GRID ENGINE] Grid activation paused due to market conditions.")
+                return
+            from grid_brain import ml_recommendation, train_ml_model
             brain = load_brain()
-            # Use regime from last known or default to 'RANGING'
+            train_ml_model()
             regime = "RANGING"
             if hasattr(self.grid_state, 'regime') and hasattr(self.grid_state.regime, 'regime'):
                 regime = getattr(self.grid_state.regime, 'regime', 'RANGING')
-            rec = get_recommendation(self.symbol, regime, brain)
+            rec = ml_recommendation(self.symbol, regime, brain)
             cfg = GridConfig(
                 symbol=self.symbol,
                 base_lot=self.lot_size,
@@ -277,6 +398,17 @@ class TradingDaemon:
             self.grid_state = activate_grid(current_price, df, cfg)
             save_grid_state(self.grid_state)
             print(f"[GRID ENGINE] New Layout Built. Bias: {self.grid_state.regime.direction_bias}. Levels: {len(self.grid_state.levels)}")
+
+    def schedule_grid_reanalysis(self, interval_minutes=5):
+        """Periodically re-analyze grid and market conditions."""
+        import threading, time
+        def loop():
+            while True:
+                print("[GRID ENGINE] Scheduled grid re-analysis...")
+                self._process_advanced_grid()
+                time.sleep(interval_minutes * 60)
+        t = threading.Thread(target=loop, daemon=True)
+        t.start()
 
     def _close_basket_safely(self):
         # Override local logic with engine closing

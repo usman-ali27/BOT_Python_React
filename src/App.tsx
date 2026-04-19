@@ -21,6 +21,7 @@ import {
 } from 'lucide-react';
 import { TradingEngine, AccountStatus, Trade, NewsEvent } from './lib/trading-engine';
 import { getMarketInsight, analyzeNewsSentiment } from './lib/gemini';
+import { fetchGoldSentiment } from './lib/sentiment';
 import { TradingChart } from './components/TradingChart';
 import { NewsFeed } from './components/NewsFeed';
 import { AccountStats } from './components/AccountStats';
@@ -30,6 +31,18 @@ const INITIAL_BALANCE = 0;
 const GOLD_BASE_PRICE = 0;
 
 export default function App() {
+    // Sentiment state (must be inside component)
+    const [goldSentiment, setGoldSentiment] = useState<number>(0);
+    // Fetch gold sentiment every 2 minutes
+    useEffect(() => {
+      const fetchSentiment = async () => {
+        const score = await fetchGoldSentiment();
+        setGoldSentiment(score);
+      };
+      fetchSentiment();
+      const interval = setInterval(fetchSentiment, 120000);
+      return () => clearInterval(interval);
+    }, []);
   const [marketPrice, setMarketPrice] = useState(GOLD_BASE_PRICE);
   const [priceHistory, setPriceHistory] = useState<{ time: string; price: number }[]>([]);
   const [engine] = useState(() => new TradingEngine(INITIAL_BALANCE));
@@ -225,25 +238,17 @@ export default function App() {
   const [isBacktesting, setIsBacktesting] = useState(false);
   const [backtestResults, setBacktestResults] = useState<any>(null);
 
+  // Fetch real backend backtest results
   const runBacktest = async () => {
     setIsBacktesting(true);
-    // Simulate 500 price points
-    const testEngine = new TradingEngine(INITIAL_BALANCE);
-    let tempPrice = GOLD_BASE_PRICE;
-    const path = [];
-    
-    for (let i = 0; i < 500; i++) {
-      tempPrice += (Math.random() - 0.5) * 5;
-      testEngine.updateTrades(tempPrice);
-      testEngine.simulateGrid(tempPrice);
-      path.push({ time: i.toString(), price: tempPrice });
+    try {
+      const res = await fetch('/api/backtest/gold4mo');
+      if (!res.ok) throw new Error('Backtest failed');
+      const data = await res.json();
+      setBacktestResults(data);
+    } catch (e) {
+      alert('Failed to fetch backtest results.');
     }
-    
-    setBacktestResults({
-      status: testEngine.getStatus(),
-      trades: testEngine.getTrades(),
-      path
-    });
     setIsBacktesting(false);
   };
 
@@ -321,6 +326,10 @@ export default function App() {
              <div className="text-[0.7rem] font-bold uppercase text-[#888888] mb-4 flex items-center gap-2">
                <BrainCircuit size={14} className="text-[#D4AF37]" />
                AI Sentiment Core
+               <span className={`ml-2 px-2 py-1 rounded text-[0.7rem] font-mono ${goldSentiment > 0.3 ? 'bg-green-900 text-green-400' : goldSentiment < -0.3 ? 'bg-red-900 text-red-400' : 'bg-zinc-800 text-zinc-300'}`}
+                 title="Live news-based sentiment score (-1 = very negative, 1 = very positive)">
+                 {goldSentiment.toFixed(2)}
+               </span>
              </div>
              <div className="bg-[#16181D] border border-[rgba(255,255,255,0.05)] p-4 rounded-[6px] mb-6 relative group overflow-hidden">
                 <div className="absolute top-0 left-0 w-1 h-full bg-[#D4AF37]" />
@@ -476,16 +485,36 @@ export default function App() {
                 </div>
               ) : activeTab === 'backtest' ? (
                 <div className="p-[20px] h-full flex flex-col gap-4">
-                   <div className="flex-1 relative">
-                     <TradingChart data={backtestResults ? backtestResults.path : []} />
-                   </div>
-                   <button 
-                     onClick={runBacktest}
-                     disabled={isBacktesting}
-                     className="w-full py-3 bg-[#23262D] border border-[rgba(255,255,255,0.08)] rounded-[6px] text-[0.75rem] font-bold uppercase tracking-[2px] hover:bg-[#D4AF37] hover:text-black transition-all duration-300 disabled:opacity-50"
-                   >
-                     {isBacktesting ? 'Synthesizing Trade Data...' : 'Run Institutional Backtest Simulation'}
-                   </button>
+                  <div className="flex-1 relative">
+                    <TradingChart data={backtestResults && backtestResults.history ? backtestResults.history.map(h => ({ time: h.time, price: h.equity })) : []} />
+                  </div>
+                  {backtestResults && (
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-center text-[0.9rem] font-mono">
+                      <div className="bg-[#16181D] rounded p-3">
+                        <div className="text-[#888] text-[0.7rem] uppercase">Final Balance</div>
+                        <div className="text-[#00FF85] text-lg font-bold">${backtestResults.final_balance?.toLocaleString()}</div>
+                      </div>
+                      <div className="bg-[#16181D] rounded p-3">
+                        <div className="text-[#888] text-[0.7rem] uppercase">Total Return</div>
+                        <div className="text-[#D4AF37] text-lg font-bold">{backtestResults.total_return_pct?.toFixed(1)}%</div>
+                      </div>
+                      <div className="bg-[#16181D] rounded p-3">
+                        <div className="text-[#888] text-[0.7rem] uppercase">Max Drawdown</div>
+                        <div className="text-[#FF4D4D] text-lg font-bold">{backtestResults.max_drawdown_pct?.toFixed(2)}%</div>
+                      </div>
+                      <div className="bg-[#16181D] rounded p-3">
+                        <div className="text-[#888] text-[0.7rem] uppercase">Win Rate</div>
+                        <div className="text-[#00D1FF] text-lg font-bold">{(backtestResults.accuracy * 100).toFixed(2)}%</div>
+                      </div>
+                    </div>
+                  )}
+                  <button
+                    onClick={runBacktest}
+                    disabled={isBacktesting}
+                    className="w-full py-3 bg-[#23262D] border border-[rgba(255,255,255,0.08)] rounded-[6px] text-[0.75rem] font-bold uppercase tracking-[2px] hover:bg-[#D4AF37] hover:text-black transition-all duration-300 disabled:opacity-50"
+                  >
+                    {isBacktesting ? 'Loading Backtest Results...' : 'Run 4-Month Gold Backtest'}
+                  </button>
                 </div>
               ) : activeTab === 'config' ? (
                 <div className="p-8">

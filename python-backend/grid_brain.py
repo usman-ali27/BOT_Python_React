@@ -1,3 +1,110 @@
+# ───────────────────────────────────────────────────────────────────────────
+# Periodic grid re-analysis (example function)
+# ───────────────────────────────────────────────────────────────────────────
+import time
+def periodic_grid_reanalysis(interval_minutes=60):
+    """Periodically retrain ML model and re-analyze past grids."""
+    while True:
+        print(f"[ML] Periodic re-analysis running...")
+        train_ml_model()
+        time.sleep(interval_minutes * 60)
+# ───────────────────────────────────────────────────────────────────────────
+# Machine Learning Enhancement (scikit-learn)
+# ───────────────────────────────────────────────────────────────────────────
+
+import joblib
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
+
+MODEL_FILE = BASE_DIR / "grid_brain_model.pkl"
+
+def prepare_ml_data():
+    """Prepare features and labels from closed trades for ML training."""
+    trades = load_closed_trades()
+    if not trades:
+        return None, None
+    df = pd.DataFrame(trades)
+    # Feature engineering: select relevant columns and fill missing
+    features = [
+        "spacing_used", "tp_multiplier", "sl_multiplier", "max_open_levels",
+        "buy_ratio", "direction", "session", "regime", "volatility", "grid_duration", "regime_detected"
+    ]
+    for col in features:
+        if col not in df:
+            df[col] = 0
+    # Encode categorical features
+    df["direction"] = df["direction"].astype(str).map({"BUY": 1, "SELL": -1}).fillna(0)
+    df["session"] = df["session"].astype(str).map({"London": 1, "NY": 2, "Asia": 3}).fillna(0)
+    df["regime"] = df["regime"].astype(str).map({"RANGING": 0, "TRENDING": 1, "BREAKOUT": 2}).fillna(0)
+    df["regime_detected"] = df["regime_detected"].astype(str).map({"RANGING": 0, "TRENDING": 1, "SIDEWAYS": 2}).fillna(0)
+    df = df.fillna(0)
+    X = df[["spacing_used", "tp_multiplier", "sl_multiplier", "max_open_levels", "buy_ratio", "direction", "session", "regime", "volatility", "grid_duration", "regime_detected"]]
+    y = df["profit_usd"]
+    return X, y
+
+def train_ml_model():
+    """Train and save a RandomForestRegressor to predict profit from grid params."""
+    X, y = prepare_ml_data()
+    if X is None or len(X) < 10:
+        print("[ML] Not enough data to train ML model.")
+        return None
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    model = RandomForestRegressor(n_estimators=100, random_state=42)
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    mse = mean_squared_error(y_test, y_pred)
+    print(f"[ML] Model trained. Test MSE: {mse:.4f}")
+    joblib.dump(model, MODEL_FILE)
+    return model
+
+def load_ml_model():
+    """Load the trained ML model if available."""
+    if MODEL_FILE.exists():
+        return joblib.load(MODEL_FILE)
+    return None
+
+def ml_recommendation(symbol: str, regime: str, brain: BrainMemory | None = None) -> dict:
+    """Use ML model to recommend grid parameters for given symbol/regime."""
+    model = load_ml_model()
+    if model is None:
+        return get_recommendation(symbol, regime, brain)
+    # Use last known stats as base features
+    rec = get_recommendation(symbol, regime, brain)
+    # Build feature vector
+    direction = 1  # Assume BUY bias for now
+    session = 1    # Assume London for now
+    regime_val = {"RANGING": 0, "TRENDING": 1, "BREAKOUT": 2}.get(regime, 0)
+    X = [[
+        rec["spacing_multiplier"],
+        rec["tp_multiplier"],
+        rec["sl_multiplier"],
+        rec["max_open_levels"],
+        rec["buy_ratio"],
+        direction,
+        session,
+        regime_val
+    ]]
+    # Predict profit for small grid param variations and pick best
+    best_params = rec.copy()
+    best_profit = -float("inf")
+    for spacing in [rec["spacing_multiplier"] * f for f in [0.8, 1.0, 1.2]]:
+        for tp in [rec["tp_multiplier"] * f for f in [0.8, 1.0, 1.2]]:
+            for sl in [rec["sl_multiplier"] * f for f in [0.8, 1.0, 1.2]]:
+                for max_open in [max(2, int(rec["max_open_levels"] * f)) for f in [0.8, 1.0, 1.2]]:
+                    test_X = [[spacing, tp, sl, max_open, rec["buy_ratio"], direction, session, regime_val]]
+                    pred_profit = model.predict(test_X)[0]
+                    if pred_profit > best_profit:
+                        best_profit = pred_profit
+                        best_params.update({
+                            "spacing_multiplier": spacing,
+                            "tp_multiplier": tp,
+                            "sl_multiplier": sl,
+                            "max_open_levels": max_open
+                        })
+    best_params["ml_predicted_profit"] = best_profit
+    best_params["ml_used"] = True
+    return best_params
 """
 Grid Brain — AI Learning Module for Grid Trading.
 
@@ -135,12 +242,50 @@ def load_closed_trades() -> list[dict]:
             try:
                 entry = json.loads(ln)
                 if entry.get("event") == "LEVEL_CLOSED":
+                    entry = enrich_trade_with_market_context(entry)
                     trades.append(entry)
             except Exception:
                 pass
     except Exception:
         pass
     return trades
+
+# ───────────────────────────────────────────────────────────────────────────
+# Market context enrichment for each trade
+# ───────────────────────────────────────────────────────────────────────────
+import numpy as np
+def enrich_trade_with_market_context(trade: dict) -> dict:
+    """
+    Add volatility, regime, and loss reason to trade dict.
+    Assumes trade contains 'open_time', 'close_time', 'symbol', 'profit_usd', 'sl_hit', 'tp_hit', etc.
+    """
+    open_price = trade.get("open_price", 0)
+    close_price = trade.get("close_price", 0)
+    profit = trade.get("profit_usd", 0)
+    # Volatility: abs(open-close) or placeholder
+    trade["volatility"] = abs(open_price - close_price)
+    # Regime detection (simple):
+    if abs(open_price - close_price) > 5:
+        trade["regime_detected"] = "TRENDING"
+    elif abs(open_price - close_price) < 2:
+        trade["regime_detected"] = "SIDEWAYS"
+    else:
+        trade["regime_detected"] = "RANGING"
+    # Loss reason
+    if profit < 0:
+        if trade.get("sl_hit", False):
+            trade["loss_reason"] = "SL_HIT"
+        elif trade.get("volatility", 0) > 5:
+            trade["loss_reason"] = "VOLATILITY_SPIKE"
+        elif trade["regime_detected"] == "TRENDING":
+            trade["loss_reason"] = "TREND_REVERSAL"
+        else:
+            trade["loss_reason"] = "OTHER"
+    else:
+        trade["loss_reason"] = "NONE"
+    # Time features (optional)
+    trade["grid_duration"] = trade.get("close_time", 0) - trade.get("open_time", 0)
+    return trade
 
 
 # ───────────────────────────────────────────────────────────────────────────

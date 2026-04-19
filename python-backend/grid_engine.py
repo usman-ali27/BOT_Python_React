@@ -315,17 +315,22 @@ def analyze_market_direction(
     mean_atr = float(atr_mean.iloc[-1]) if not atr_mean.empty else current_atr
     atr_ratio = current_atr / mean_atr if mean_atr > 0 else 1.0
 
-    # Regime classification (from grid timeframe — determines spacing/lot behaviour)
-    if atr_ratio > 1.5:
+
+    # --- Dynamic regime classification ---
+    # Use rolling ATR and EMA separation to set dynamic thresholds
+    ema_sep = abs(float(ema20.iloc[-1]) - float(ema50.iloc[-1]))
+    ema_sep_mean = abs(ema20 - ema50).rolling(30).mean().iloc[-1]
+    atr_dyn_thresh = max(1.3, min(2.0, atr_ratio * 1.1))
+    ema_dyn_thresh = max(0.2, min(0.5, ema_sep_mean / (mean_atr + 1e-6)))
+    if atr_ratio > atr_dyn_thresh:
         regime = "VOLATILE"
-    elif abs(float(ema20.iloc[-1]) - float(ema50.iloc[-1])) > current_atr * 0.3:
+    elif ema_sep > current_atr * ema_dyn_thresh:
         regime = "TRENDING"
     else:
         regime = "RANGING"
 
-    # ── Directional bias — prefer HTF structure when available ──
-    # HTF EMAs change slowly (1H/4H), giving a stable structural direction
-    # that doesn't flip on every 5m candle.
+
+    # --- Directional bias: add price momentum and dynamic scoring ---
     if htf_df is not None and len(htf_df) >= 50:
         htf_close = htf_df["Close"]
         htf_ema20 = _ema(htf_close, 20)
@@ -349,7 +354,6 @@ def analyze_market_direction(
 
         ema_slope = htf_slope  # record HTF slope for diagnostics
     else:
-        # No HTF available — fallback to grid-timeframe EMAs (original behaviour)
         ema_slope = float(ema20.iloc[-1] - ema20.iloc[-3]) if len(ema20) >= 3 else 0.0
         ema_bull_pts = 0
         ema_bear_pts = 0
@@ -364,6 +368,13 @@ def analyze_market_direction(
         elif ema_slope < 0:
             ema_bear_pts += 1
 
+    # --- Add price momentum (last 5 bars) ---
+    price_momentum = float(close.iloc[-1] - close.iloc[-5]) if len(close) >= 5 else 0.0
+    if price_momentum > current_atr * 0.25:
+        ema_bull_pts += 1
+    elif price_momentum < -current_atr * 0.25:
+        ema_bear_pts += 1
+
     # ICT signal counting (last 20 signals)
     bull_count = 0
     bear_count = 0
@@ -372,20 +383,27 @@ def analyze_market_direction(
         bull_count = int((recent["direction"] == "bullish").sum())
         bear_count = int((recent["direction"] == "bearish").sum())
 
-    # Combine all evidence
+
+    # --- Dynamic thresholding and feedback loop ---
+    # Optionally, use recent prediction accuracy to auto-tune sensitivity (stub: can be expanded)
+    # For now, use dynamic thresholds based on volatility
     total_bull = ema_bull_pts + bull_count
     total_bear = ema_bear_pts + bear_count
     total_signals = total_bull + total_bear
+
+    # Dynamic thresholds: more sensitive in high volatility
+    bull_thresh = 0.55 if regime == "VOLATILE" else 0.60
+    bear_thresh = 0.45 if regime == "VOLATILE" else 0.40
 
     if total_signals == 0:
         direction_bias: DirectionBias = "NEUTRAL"
         raw_confidence = 0.0
     else:
         ratio = total_bull / total_signals
-        if ratio > 0.60:
+        if ratio > bull_thresh:
             direction_bias = "BULLISH"
             raw_confidence = (ratio - 0.5) * 200.0   # 0-100 scale
-        elif ratio < 0.40:
+        elif ratio < bear_thresh:
             direction_bias = "BEARISH"
             raw_confidence = (0.5 - ratio) * 200.0
         else:
